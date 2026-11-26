@@ -185,6 +185,14 @@ changing document bytes already accepted by Docs.
 
 #### Build the DeckWise image
 
+Run **Publish DeckWise Document Server** in GitHub Actions. The workflow uses
+the repository's `ACR_USERNAME` and `ACR_PASSWORD` secrets to publish the
+image with the full DocumentServer commit SHA as its tag. The image contains
+the WiseOffice entry, plugin and preview files. Shuttle uses Runtime Only
+mode and the same commit SHA to pull this image before starting Compose.
+
+For a local build, use the steps below.
+
 Use the WiseOffice and DeckWise sources containing the online teaching
 integration. Install those projects' build dependencies first. The image uses
 the official ONLYOFFICE Docs 10.0.0-169 container as its base. This build was
@@ -201,15 +209,18 @@ git -C server apply ../deckwise-server.patch
 output=$(mktemp -d)
 PRODUCT_VERSION=10.0.0 BUILD_NUMBER=169 python3 "$SDK_DIR/build/build.py" --product slide
 node "$DESKTOP_DIR/scripts/build-wiseoffice-maic.mjs" "$OFFICE_DIR" "$output/teaching" --docs-native
-docker build -f Dockerfile.deckwise -t deckwise-documentserver:10.0.0-169 \
-  --build-context slide-sdk="$SDK_DIR/deploy/sdkjs/slide" \
-  --build-context wiseoffice="$output/teaching" .
-
-container=$(docker create deckwise-documentserver:10.0.0-169)
+base_image=$(awk '/^FROM onlyoffice\/documentserver:/ { print $2; exit }' Dockerfile.deckwise)
+docker pull "$base_image"
+container=$(docker create "$base_image")
 docker cp "$container:/var/www/onlyoffice/documentserver/sdkjs-plugins/v1/plugins.js" "$output/plugins.js"
 docker rm -v "$container"
 node "$OFFICE_DIR/bin/build-courseware-online.mjs" "$output/client" "$output/plugins.js"
 cp -R "$output/teaching/deckwise-runtime" "$output/client/"
+
+docker build -f Dockerfile.deckwise -t deckwise-documentserver:10.0.0-169 \
+  --build-context slide-sdk="$SDK_DIR/deploy/sdkjs/slide" \
+  --build-context wiseoffice="$output/teaching" \
+  --build-context client="$output/client" .
 ```
 
 Run the patch command once per clean server checkout.
@@ -227,8 +238,8 @@ from this repository on the host with the shared `trainwise_net` network.
 docker compose -f docker-compose.deckwise-office.yml up -d
 ```
 
-Copy the contents of `$output/client/` to `/home/app/wiseoffice/online/`
-on the gateway host.
+Forward `/deckwise-office/` through the gateway to the Docs container,
+including the `/deckwise-office/client/` paths.
 
 ## 🐳 Quick start with Docker
 

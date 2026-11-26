@@ -1,0 +1,81 @@
+name: Publish DeckWise Document Server
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: deckwise-image-${{ github.sha }}
+
+env:
+  IMAGE_REPOSITORY: registry.cn-beijing.aliyuncs.com/jhz007/deckwise-documentserver
+
+jobs:
+  publish:
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v4
+      - name: Prepare the pinned Docs server
+        run: |
+          git -c submodule.server.url=https://github.com/ONLYOFFICE/server.git submodule update --init --depth 1 server
+          git -C server apply ../deckwise-server.patch
+
+      - name: Check out SDK.js
+        uses: actions/checkout@v4
+        with:
+          repository: ONLYOFFICE/sdkjs
+          ref: 3679e0375a758d7dc59d31337a45461be3525ed8
+          path: build-inputs/sdk
+          persist-credentials: false
+      - name: Check out WiseOffice
+        uses: actions/checkout@v4
+        with:
+          repository: ganity/document
+          ref: a37e31f046926a5e55844b7807f98f1c5215aa81
+          path: build-inputs/office
+          persist-credentials: false
+      - name: Check out DeckWise
+        uses: actions/checkout@v4
+        with:
+          repository: ganity/deckwise
+          ref: 97fd81fa3309031a38ab42fba9641469de2ba28a
+          path: build-inputs/desktop
+          persist-credentials: false
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 24
+      - name: Build the SDK and WiseOffice assets
+        run: |
+          PRODUCT_VERSION=10.0.0 BUILD_NUMBER=169 python3 build-inputs/sdk/build/build.py --product slide
+          (cd build-inputs/office && corepack pnpm install --frozen-lockfile)
+          (cd build-inputs/desktop && corepack pnpm install --frozen-lockfile)
+          output="$RUNNER_TEMP/docs"
+          mkdir -p "$output"
+          node build-inputs/desktop/scripts/build-wiseoffice-maic.mjs build-inputs/office "$output/teaching" --docs-native
+          base_image=$(awk '/^FROM onlyoffice\/documentserver:/ { print $2; exit }' Dockerfile.deckwise)
+          docker pull --platform linux/amd64 "$base_image"
+          base_container=$(docker create "$base_image")
+          trap 'docker rm -v "$base_container" >/dev/null' EXIT
+          docker cp "$base_container:/var/www/onlyoffice/documentserver/sdkjs-plugins/v1/plugins.js" "$output/plugins.js"
+          node build-inputs/office/bin/build-courseware-online.mjs "$output/client" "$output/plugins.js"
+          cp -R "$output/teaching/deckwise-runtime" "$output/client/"
+          test -s "$output/client/courseware-online.html"
+          test -s "$output/client/deckwise-runtime/teaching-preview.mjs"
+
+      - name: Build and publish to ACR
+        env:
+          ACR_USERNAME: ${{ secrets.ACR_USERNAME }}
+          ACR_PASSWORD: ${{ secrets.ACR_PASSWORD }}
+        run: |
+          : "${ACR_USERNAME:?Configure ACR_USERNAME for this repository}"
+          : "${ACR_PASSWORD:?Configure ACR_PASSWORD for this repository}"
+          printf '%s' "$ACR_PASSWORD" | docker login "${IMAGE_REPOSITORY%%/*}" --username "$ACR_USERNAME" --password-stdin
+          output="$RUNNER_TEMP/docs"
+          docker buildx build --platform linux/amd64 --provenance=false --sbom=false \
+            --build-context slide-sdk=build-inputs/sdk/deploy/sdkjs/slide \
+            --build-context wiseoffice="$output/teaching" \
+            --build-context client="$output/client" \
+            -f Dockerfile.deckwise -t "$IMAGE_REPOSITORY:$GITHUB_SHA" --push .
