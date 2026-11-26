@@ -52,6 +52,7 @@ jobs:
           PRODUCT_VERSION=10.0.0 BUILD_NUMBER=169 python3 build-inputs/sdk/build/build.py --product slide
           (cd build-inputs/office && corepack pnpm install --frozen-lockfile)
           (cd build-inputs/desktop && corepack pnpm install --frozen-lockfile)
+          (cd build-inputs/desktop && corepack pnpm --filter '@pi-desktop/desktop^...' --fail-if-no-match build)
           output="$RUNNER_TEMP/docs"
           mkdir -p "$output"
           node build-inputs/desktop/scripts/build-wiseoffice-maic.mjs build-inputs/office "$output/teaching" --docs-native
