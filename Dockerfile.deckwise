@@ -1,0 +1,44 @@
+FROM node:24-bookworm-slim AS dependencies
+WORKDIR /build
+ARG npm_config_sharp_libvips_binary_host
+ARG npm_config_sharp_binary_host
+COPY server/Common/package.json server/Common/npm-shrinkwrap.json Common/
+COPY server/DocService/package.json server/DocService/npm-shrinkwrap.json DocService/
+COPY server/FileConverter/package.json server/FileConverter/npm-shrinkwrap.json FileConverter/
+RUN --mount=type=cache,target=/root/.npm npm ci --omit=dev --prefix Common \
+    && npm ci --omit=dev --prefix DocService \
+    && npm ci --omit=dev --prefix FileConverter \
+    && node -e "require('./DocService/node_modules/sharp')"
+
+FROM onlyoffice/documentserver:10.0.0@sha256:ca17889f10b11141cc6441836aebdd2835cf3e1b49681b2fd6e155c94b7850b3
+WORKDIR /var/www/onlyoffice/documentserver/server
+COPY --from=dependencies /usr/local/bin/node /usr/local/bin/node
+COPY --chown=ds:ds server/Common/sources Common/sources
+COPY --chown=ds:ds server/DocService/sources DocService/sources
+COPY --chown=ds:ds server/FileConverter/sources FileConverter/sources
+COPY --from=dependencies /build/ ./
+# The Ubuntu service wrapper clears DeckWise's environment variables.
+RUN set -eu; \
+    release="$(dpkg-query -W -f='${Version}' onlyoffice-documentserver)"; \
+    version="${release%-*}"; \
+    build="${release##*-}"; \
+    test "$release" = '10.0.0-169'; \
+    sed -i -E "s/^const buildVersion = '[^']+';/const buildVersion = '$version';/; s/^const buildNumber = [0-9]+;/const buildNumber = $build;/" Common/sources/commondefines.js; \
+    grep -Fx "const buildVersion = '$version';" Common/sources/commondefines.js; \
+    grep -Fx "const buildNumber = $build;" Common/sources/commondefines.js; \
+    sed -i 's#^command=.*#command=/usr/local/bin/node /var/www/onlyoffice/documentserver/server/DocService/sources/server.js#' /etc/supervisor/conf.d/ds-docservice.conf; \
+    sed -i 's#service supervisor start#/etc/init.d/supervisor start#' /app/ds/run-document-server.sh; \
+    grep -F '/etc/init.d/supervisor start' /app/ds/run-document-server.sh
+
+WORKDIR /var/www/onlyoffice/deckwise-slide-sdk
+COPY --from=slide-sdk sdk-all-min.js sdk-all.js ./
+COPY --from=wiseoffice wiseoffice-teaching.js /tmp/wiseoffice-teaching.js
+RUN set -eu; \
+    test -s sdk-all-min.js && test -s sdk-all.js && test -s /tmp/wiseoffice-teaching.js; \
+    printf '\n;\n' >> sdk-all.js; \
+    cat /tmp/wiseoffice-teaching.js >> sdk-all.js; \
+    rm /tmp/wiseoffice-teaching.js; \
+    gzip -k sdk-all-min.js sdk-all.js
+# The native PPTX converter uses the SDK files installed with ONLYOFFICE.
+COPY deckwise-slide.conf /etc/nginx/includes/ds-deckwise-slide.conf
+WORKDIR /var/www/onlyoffice/documentserver

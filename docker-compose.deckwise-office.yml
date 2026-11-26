@@ -1,0 +1,24 @@
+services:
+  deckwise-docs:
+    image: "${DECKWISE_DOCS_IMAGE:?Set the image built with the DeckWise Document Server changes}"
+    environment:
+      JWT_ENABLED: "true"
+      JWT_IN_BODY: "true"
+      JWT_SECRET: "${DECKWISE_DOCS_JWT_SECRET:?Set the Document Server JWT secret}"
+      DECKWISE_DOCS_ACCESS_URL: https://trainwise.efrobot.com/api/backend/courseware/document-server/editor-access
+      DECKWISE_DOCS_ACCESS_SECRET: "${DECKWISE_DOCS_ACCESS_SECRET:?Set the shared Platform access-check secret}"
+    volumes:
+      - deckwise-docs-files:/var/lib/onlyoffice
+      - deckwise-docs-db:/var/lib/postgresql
+    restart: unless-stopped
+    networks:
+      - trainwise_net
+
+volumes:
+  deckwise-docs-files:
+  deckwise-docs-db:
+
+networks:
+  trainwise_net:
+    name: ${TRAINWISE_DOCKER_NETWORK:-trainwise_net}
+    external: true

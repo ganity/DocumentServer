@@ -172,6 +172,64 @@ The table below will help you make the right choice.
 * **October 2026 Node.js vulnerabilities:** Enterprise and Developer builds now run on Node.js 24.22.1, with fix branches 10.0.2 and 9.4.2 for older versions. [Learn more ↗](https://www.onlyoffice.com/blog/2026/10/onlyoffice-docs-patches-node-js-vulnerability?utm_source=github&utm_medium=cpc&utm_campaign=GitHubDS&utm_content=security)
 * **Found a vulnerability?** Please report it responsibly to [security@onlyoffice.com](mailto:security@onlyoffice.com).
 
+### DeckWise live editor authorization
+
+For a DeckWise-managed Docs deployment, set `DECKWISE_DOCS_ACCESS_URL` to
+the Platform `/courseware/document-server/editor-access` endpoint and set
+`DECKWISE_DOCS_ACCESS_SECRET` to the same 32-byte-or-longer secret configured
+as `trainwise.courseware.document-server.access-check-secret` in Platform.
+Set both variables on every Docs co-authoring service instance. Registered
+DeckWise editor identities are denied if this check is not configured. A
+Platform denial or outage closes the affected editor connection without
+changing document bytes already accepted by Docs.
+
+#### Build the DeckWise image
+
+Use the WiseOffice and DeckWise sources containing the online teaching
+integration. Install those projects' build dependencies first. The image uses
+the official ONLYOFFICE Docs 10.0.0-169 container as its base. This build was
+tested on Linux x86-64.
+
+Run from the DocumentServer root. Set `OFFICE_DIR` to the WiseOffice checkout,
+`DESKTOP_DIR` to the DeckWise checkout and `SDK_DIR` to
+[the SDK.js source at commit 3679e03](https://github.com/ONLYOFFICE/sdkjs/tree/3679e0375a758d7dc59d31337a45461be3525ed8).
+
+```bash
+git -c submodule.server.url=https://github.com/ONLYOFFICE/server.git submodule update --init server
+git -C server apply ../deckwise-server.patch
+
+output=$(mktemp -d)
+PRODUCT_VERSION=10.0.0 BUILD_NUMBER=169 python3 "$SDK_DIR/build/build.py" --product slide
+node "$DESKTOP_DIR/scripts/build-wiseoffice-maic.mjs" "$OFFICE_DIR" "$output/teaching" --docs-native
+docker build -f Dockerfile.deckwise -t deckwise-documentserver:10.0.0-169 \
+  --build-context slide-sdk="$SDK_DIR/deploy/sdkjs/slide" \
+  --build-context wiseoffice="$output/teaching" .
+
+container=$(docker create deckwise-documentserver:10.0.0-169)
+docker cp "$container:/var/www/onlyoffice/documentserver/sdkjs-plugins/v1/plugins.js" "$output/plugins.js"
+docker rm -v "$container"
+node "$OFFICE_DIR/bin/build-courseware-online.mjs" "$output/client" "$output/plugins.js"
+cp -R "$output/teaching/deckwise-runtime" "$output/client/"
+```
+
+Run the patch command once per clean server checkout.
+
+If Sharp's GitHub binary downloads time out on the build host, set Docker
+build arguments `npm_config_sharp_libvips_binary_host` and
+`npm_config_sharp_binary_host` to a mirror accessible from that host.
+
+Set `DECKWISE_DOCS_IMAGE` to the resulting image and provide
+`DECKWISE_DOCS_JWT_SECRET` and `DECKWISE_DOCS_ACCESS_SECRET` in the deployment
+environment. Start Docs with [the Compose file](docker-compose.deckwise-office.yml)
+from this repository on the host with the shared `trainwise_net` network.
+
+```bash
+docker compose -f docker-compose.deckwise-office.yml up -d
+```
+
+Copy the contents of `$output/client/` to `/home/app/wiseoffice/online/`
+on the gateway host.
+
 ## 🐳 Quick start with Docker
 
 Run ONLYOFFICE Docs Community with one command:

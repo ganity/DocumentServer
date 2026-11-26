@@ -1,0 +1,370 @@
+diff --git a/DocService/sources/DocsCoServer.js b/DocService/sources/DocsCoServer.js
+index dbdf777..684b900 100644
+--- a/DocService/sources/DocsCoServer.js
++++ b/DocService/sources/DocsCoServer.js
+@@ -107,6 +107,8 @@ const memoryGuard = require('./../../Common/sources/runtime/memoryGuard');
+ const {notificationTypes, ...notificationService} = require('../../Common/sources/notificationService');
+ const aiProxyHandler = require('./ai/aiProxyHandler');
+ const jwtService = require('./jwtService');
++const {createEditorAccess, guardedMessages, isManagedClientUserId, isWriteMessage} = require('./deckwiseEditorAccess');
++const deckwiseEditorAccess = createEditorAccess(process.env.DECKWISE_DOCS_ACCESS_URL, process.env.DECKWISE_DOCS_ACCESS_SECRET);
+ const {signToken, checkJwt, checkJwtForConnection, checkJwtHeader} = jwtService;
+ 
+ const {editorDataStorage, editorStatStorage} = require('./editorDataStorage');
+@@ -1408,8 +1410,23 @@ async function startWopiRPC(ctx, docId, userId, userIdOriginal, data) {
+ }
+ function* startRPC(ctx, conn, responseKey, data) {
+   const docId = conn.docId;
++  if (data.type === 'deckwiseTeachingTts') {
++    let result = {code: 46000, message: 'ONLINE_TTS_UNAVAILABLE'};
++    if (deckwiseEditorAccess && conn.user && !conn.user.view && conn.editorType === EditorTypes.presentation) {
++      try {
++        result = yield deckwiseEditorAccess.tts(docId, conn.user.idOriginal, data.command);
++      } catch {
++        result = {code: 46016, message: 'UPSTREAM_OUTCOME_UNKNOWN'};
++      }
++    }
++    sendDataRpc(ctx, conn, responseKey, result);
++    return;
++  }
+   ctx.logger.debug('startRPC start responseKey:%s , %j', responseKey, data);
+   switch (data.type) {
++    case 'deckwiseTeachingSaveCapability':
++      sendDataRpc(ctx, conn, responseKey, {available: !!conn.user && !conn.user.view && conn.editorType === EditorTypes.presentation});
++      break;
+     case 'sendForm': {
+       let forceSaveRes;
+       if (canStartForceSave(conn)) {
+@@ -1638,6 +1655,13 @@ function dropUserFromDocument(ctx, docId, users, description) {
+     }
+   }
+ }
++
++function closeDeckwiseConnection(ctx, conn, access) {
++  if (!conn.connected) return;
++  if (access === 'unavailable') ctx.logger.warn('DeckWise editor access check unavailable');
++  sendDataDisconnectReason(ctx, conn, constants.ACCESS_DENIED_CODE, constants.ACCESS_DENIED_REASON);
++  conn.disconnect(true);
++}
+ function getLocalConnectionCount(ctx, docId) {
+   return connections.reduce((count, conn) => {
+     if (conn.docId === docId && conn.tenant === ctx.tenant) {
+@@ -2034,6 +2058,14 @@ exports.install = function (server, app, callbackFunction) {
+               ctx.logger.debug('Server shutdown receive data');
+               return;
+             }
++            if (deckwiseEditorAccess && guardedMessages.has(data.type)) {
++              const access = conn.user && (yield deckwiseEditorAccess(conn.docId, conn.user.idOriginal, isWriteMessage(data, conn.user)));
++              if (access !== 'allowed') {
++                closeDeckwiseConnection(ctx, conn, access);
++                return;
++              }
++              if (!conn.connected) return;
++            }
+             if (
+               (conn.isCloseCoAuthoring || (conn.user && conn.user.view)) &&
+               ('getLock' == data.type || 'saveChanges' == data.type || 'isSaveLock' == data.type)
+@@ -2077,6 +2109,7 @@ exports.install = function (server, app, callbackFunction) {
+                 yield* isSaveLock(ctx, conn, data);
+                 break;
+               case 'unSaveLock':
++                conn.deckwiseTeachingSave = undefined;
+                 yield* unSaveLock(ctx, conn, -1, -1, -1);
+                 break; // The index is sent -1, because this is an emergency withdrawal without saving
+               case 'getMessages':
+@@ -2151,6 +2184,7 @@ exports.install = function (server, app, callbackFunction) {
+         });
+       });
+       conn.on('disconnect', reason => {
++        clearInterval(conn.deckwiseAccessTimer);
+         return co(function* () {
+           const ctx = new operationContext.Context();
+           try {
+@@ -2964,6 +2998,10 @@ exports.install = function (server, app, callbackFunction) {
+         if (checkJwtRes.decoded) {
+           isDecoded = true;
+           const decoded = checkJwtRes.decoded;
++          if (deckwiseEditorAccess && (!decoded.document?.key || !decoded.editorConfig?.user?.id)) {
++            closeDeckwiseConnection(ctx, conn);
++            return;
++          }
+           let fillDataFromJwtRes = false;
+           if (wopiClient.isWopiJwtToken(decoded)) {
+             //wopi
+@@ -2992,7 +3030,7 @@ exports.install = function (server, app, callbackFunction) {
+               }
+             }
+           }
+-          if (!fillDataFromJwtRes) {
++          if (!fillDataFromJwtRes || (deckwiseEditorAccess && (decoded.document.key !== data.docid || decoded.editorConfig.user.id !== data.user.id))) {
+             ctx.logger.warn('fillDataFromJwt return false');
+             sendDataDisconnectReason(ctx, conn, constants.ACCESS_DENIED_CODE, constants.ACCESS_DENIED_REASON);
+             conn.disconnect(true);
+@@ -3008,6 +3046,18 @@ exports.install = function (server, app, callbackFunction) {
+ 
+       const docId = data.docid;
+       const user = data.user;
++      if (isManagedClientUserId(user.id) && !deckwiseEditorAccess) {
++        closeDeckwiseConnection(ctx, conn);
++        return;
++      }
++      if (deckwiseEditorAccess) {
++        const access = isDecoded && (yield deckwiseEditorAccess(docId, user.id, isEditMode(data.permissions, data.mode)));
++        if (access !== 'allowed') {
++          closeDeckwiseConnection(ctx, conn, access);
++          return;
++        }
++      }
++      if (!conn.connected) return;
+ 
+       //todo minimize select calls on opening
+       const result = yield taskResult.select(ctx, docId);
+@@ -3121,6 +3171,21 @@ exports.install = function (server, app, callbackFunction) {
+         indexUser: curIndexUser,
+         view: !isEditMode(data.permissions, data.mode)
+       };
++      if (deckwiseEditorAccess && !conn.deckwiseAccessTimer) {
++        let checking = false;
++        conn.deckwiseAccessTimer = setInterval(async () => {
++          if (!conn.connected || checking) return;
++          checking = true;
++          try {
++            const access = await deckwiseEditorAccess(conn.docId, conn.user.idOriginal, !conn.user.view);
++            if (access !== 'allowed') {
++              closeDeckwiseConnection(ctx, conn, access);
++            }
++          } finally {
++            checking = false;
++          }
++        }, 5000);
++      }
+       if (conn.user.view && utils.isLiveViewerSupport(licenseInfo)) {
+         conn.coEditingMode = data.coEditingMode;
+       }
+@@ -3701,6 +3766,17 @@ exports.install = function (server, app, callbackFunction) {
+       userId = conn.user.id;
+     ctx.logger.info('Start saveChanges: reSave: %s', data.reSave);
+ 
++    const teachingSave = conn.deckwiseTeachingSave;
++    if (teachingSave || data.deckwiseTeachingSaveId !== undefined) {
++      if (!teachingSave || teachingSave.id !== data.deckwiseTeachingSaveId || teachingSave.saving ||
++          !data.startSaveChanges || !data.endSaveChanges ||
++          (data.deleteIndex != null && data.deleteIndex !== -1 && data.deleteIndex !== teachingSave.index)) {
++        sendDataDisconnectReason(ctx, conn, constants.ACCESS_DENIED_CODE, constants.ACCESS_DENIED_REASON);
++        conn.disconnect(true);
++        return;
++      }
++      teachingSave.saving = true;
++    }
+     const lockRes = yield editorData.lockSave(ctx, docId, userId, tenExpSaveLock);
+     if (!lockRes) {
+       //should not be here. cfgExpSaveLock - 60sec, sockjs disconnects after 25sec
+@@ -3710,6 +3786,12 @@ exports.install = function (server, app, callbackFunction) {
+ 
+     let puckerIndex = yield* getChangesIndex(ctx, docId);
+ 
++    if (teachingSave && teachingSave.index !== puckerIndex) {
++      yield editorData.unlockSave(ctx, docId, userId);
++      sendDataDisconnectReason(ctx, conn, constants.ACCESS_DENIED_CODE, constants.ACCESS_DENIED_REASON);
++      conn.disconnect(true);
++      return;
++    }
+     if (constants.CONN_CLOSED === conn.conn.readyState) {
+       //closing could happen during async action
+       return;
+@@ -3817,7 +3899,8 @@ exports.install = function (server, app, callbackFunction) {
+         );
+       }
+       // Automatically remove the lock ourselves and send the index to save
+-      yield* unSaveLock(ctx, conn, changesIndex, newChangesLastTime, puckerIndex);
++      conn.deckwiseTeachingSave = undefined;
++      yield* unSaveLock(ctx, conn, changesIndex, newChangesLastTime, puckerIndex, teachingSave?.id);
+       //last save
+       const changeInfo = getExternalChangeInfo(conn.user, newChangesLastTime, conn.lang);
+       yield resetForceSaveAfterChanges(ctx, docId, newChangesLastTime, puckerIndex, utils.getBaseUrlByConnection(ctx, conn), changeInfo);
+@@ -3863,6 +3946,37 @@ exports.install = function (server, app, callbackFunction) {
+     if (!conn.user) {
+       return;
+     }
++    if (conn.deckwiseTeachingSave) {
++      sendData(ctx, conn, {type: 'saveLock', saveLock: true});
++      return;
++    }
++    if (data.deckwiseTeachingSaveId !== undefined) {
++      const id = data.deckwiseTeachingSaveId;
++      const index = data.syncChangesIndex;
++      if (conn.editorType !== EditorTypes.presentation || conn.user.view ||
++          typeof id !== 'string' || !/^[0-9a-f]{8}(?:-[0-9a-f]{4}){3}-[0-9a-f]{12}$/.test(id) ||
++          !Number.isSafeInteger(index) || index < 0 || conn.deckwiseTeachingLockPending) {
++        sendData(ctx, conn, {type: 'saveLock', saveLock: true});
++        return;
++      }
++      conn.deckwiseTeachingLockPending = true;
++      try {
++        let granted = yield editorData.lockSave(ctx, conn.docId, conn.user.id, tenExpSaveLock);
++        if (granted && (yield* getChangesIndex(ctx, conn.docId)) !== index) {
++          yield editorData.unlockSave(ctx, conn.docId, conn.user.id);
++          granted = false;
++        }
++        if (granted) conn.deckwiseTeachingSave = {id, index};
++        sendData(ctx, conn, {type: 'saveLock', saveLock: !granted, deckwiseTeachingSaveId: id, syncChangesIndex: index});
++      } finally {
++        conn.deckwiseTeachingLockPending = false;
++      }
++      return;
++    }
++    if (conn.deckwiseTeachingLockPending) {
++      sendData(ctx, conn, {type: 'saveLock', saveLock: true});
++      return;
++    }
+     let lockRes = true;
+     //check changesIndex for compatibility or 0 in case of first save
+     if (data.syncChangesIndex) {
+@@ -3901,10 +4015,10 @@ exports.install = function (server, app, callbackFunction) {
+   }
+ 
+   // Removing lock from save
+-  function* unSaveLock(ctx, conn, index, time, syncChangesIndex) {
++  function* unSaveLock(ctx, conn, index, time, syncChangesIndex, deckwiseTeachingSaveId) {
+     const unlockRes = yield editorData.unlockSave(ctx, conn.docId, conn.user.id);
+     if (commonDefines.c_oAscUnlockRes.Locked !== unlockRes) {
+-      sendData(ctx, conn, {type: 'unSaveLock', index, time, syncChangesIndex});
++      sendData(ctx, conn, {type: 'unSaveLock', index, time, syncChangesIndex, deckwiseTeachingSaveId});
+     } else {
+       ctx.logger.warn('unSaveLock failure');
+     }
+diff --git a/DocService/sources/deckwiseEditorAccess.js b/DocService/sources/deckwiseEditorAccess.js
+new file mode 100644
+index 0000000..813618c
+--- /dev/null
++++ b/DocService/sources/deckwiseEditorAccess.js
+@@ -0,0 +1,72 @@
++'use strict';
++
++const writeMessages = new Set(['getLock', 'isSaveLock', 'saveChanges', 'unLockDocument', 'unSaveLock', 'forceSaveStart']);
++const writeRpcMessages = new Set(['sendForm', 'saveRelativeFromChanges', 'wopi_RenameFile', 'wopi_RefreshFile', 'deckwiseTeachingTts']);
++const guardedMessages = new Set([...writeMessages, 'openDocument', 'rpc']);
++const managedClientId = /^tenant-[1-9][0-9]{0,18}-user-[1-9][0-9]{0,18}-client-[0-9a-f]{8}(?:-[0-9a-f]{4}){3}-[0-9a-f]{12}$/u;
++
++function isWriteMessage(data, user) {
++  return writeMessages.has(data.type) ||
++    (data.type === 'rpc' && writeRpcMessages.has(data.data?.type)) ||
++    !user.view;
++}
++
++function isManagedClientUserId(userId) {
++  return managedClientId.test(userId || '');
++}
++
++function createEditorAccess(endpoint, secret, request = fetch) {
++  if (!endpoint && !secret) return null;
++  if (!endpoint || !secret) throw new Error('Incomplete DeckWise editor access configuration');
++  const url = new URL(endpoint);
++  if (url.protocol !== 'https:' && !(url.protocol === 'http:' && ['127.0.0.1', 'localhost', '[::1]'].includes(url.hostname))) {
++    throw new Error('DeckWise editor access requires HTTPS or loopback HTTP');
++  }
++  if (url.username || url.password || url.search || url.hash || !secret || Buffer.byteLength(secret) < 32 || /[\r\n]/u.test(secret)) {
++    throw new Error('Invalid DeckWise editor access configuration');
++  }
++  const check = async (documentKey, docsUserId, edit) => {
++    const target = new URL(url);
++    target.search = new URLSearchParams({documentKey, docsUserId, edit});
++    try {
++      const response = await request(target, {
++        method: 'POST',
++        headers: {'X-DeckWise-Docs-Access': secret},
++        redirect: 'error',
++        signal: AbortSignal.timeout(2000)
++      });
++      try { await response.body?.cancel(); } catch { /* The access decision depends on the response status only. */ }
++      if (response.status === 204) return 'allowed';
++      if (response.status === 403) return 'denied';
++    } catch {
++      // The caller distinguishes a revoked mount from an unavailable Platform.
++    }
++    return 'unavailable';
++  };
++  check.tts = async (documentKey, docsUserId, command) => {
++    if (!command || !['models', 'quote', 'submit'].includes(command.operation))
++      return {code: 46001, message: 'INVALID_REQUEST'};
++    const body = JSON.stringify(command);
++    if (Buffer.byteLength(body) > 32768) return {code: 46001, message: 'INVALID_REQUEST'};
++    const target = new URL('editor-tts', url);
++    target.search = new URLSearchParams({documentKey, docsUserId});
++    const response = await request(target, {
++      method: 'POST',
++      headers: {'X-DeckWise-Docs-Access': secret, 'Content-Type': 'application/json'},
++      redirect: 'error',
++      signal: AbortSignal.timeout(185000),
++      body
++    });
++    if (!response.ok) {
++      try { await response.body?.cancel(); } catch { /* The status already determines the outcome. */ }
++      if (response.status >= 500 && command.operation === 'submit') {
++        return {code: 46016, message: 'UPSTREAM_OUTCOME_UNKNOWN'};
++      }
++      return {code: 46000, message: response.status === 403 ? 'AUTH_REQUIRED' : 'ONLINE_TTS_UNAVAILABLE'};
++    }
++    return response.json();
++  };
++  return check;
++}
++
++module.exports = {createEditorAccess, guardedMessages, isManagedClientUserId, isWriteMessage};
+diff --git a/tests/unit/deckwiseEditorAccess.tests.js b/tests/unit/deckwiseEditorAccess.tests.js
+new file mode 100644
+index 0000000..7b2316b
+--- /dev/null
++++ b/tests/unit/deckwiseEditorAccess.tests.js
+@@ -0,0 +1,51 @@
++'use strict';
++
++const {describe, it, expect} = require('@jest/globals');
++const {createEditorAccess, guardedMessages, isManagedClientUserId, isWriteMessage} = require('../../DocService/sources/deckwiseEditorAccess');
++
++describe('DeckWise registered editor access', () => {
++  const secret = 'a-local-test-secret-with-more-than-thirty-two-bytes';
++  const identity = ['courseware-key', 'tenant-1-user-2-client-11111111-1111-4111-8111-111111111111', true];
++
++  it('requires a trusted endpoint and strong shared secret', () => {
++    for (const [url, key] of [
++      ['http://docs.example/access', secret],
++      ['http://127.0.0.1/access', 'short'],
++      ['https://docs.example/access?redirect=unsafe', secret],
++      ['https://user:pass@docs.example/access', secret],
++      ['https://docs.example/access', secret + '\nInjected: true'],
++    ]) expect(() => createEditorAccess(url, key)).toThrow();
++    expect(createEditorAccess(undefined, undefined)).toBeNull();
++    expect(isManagedClientUserId(identity[1])).toBe(true);
++    expect(isManagedClientUserId('ordinary-user-id')).toBe(false);
++  });
++
++  it('allows the exact registered request, denies revoked mounts and fails closed on outages', async () => {
++    const calls = [];
++    const access = createEditorAccess('https://platform.example/courseware/document-server/editor-access', secret,
++      async (url, options) => {
++        calls.push({url, options});
++        return {status: calls.length === 1 ? 204 : calls.length === 2 ? 403 : 503, body: null};
++      });
++    expect(await access(...identity)).toBe('allowed');
++    expect(await access(...identity)).toBe('denied');
++    expect(await access(...identity)).toBe('unavailable');
++    expect(calls[0].url.searchParams.get('documentKey')).toBe(identity[0]);
++    expect(calls[0].url.searchParams.get('docsUserId')).toBe(identity[1]);
++    expect(calls[0].options.headers['X-DeckWise-Docs-Access']).toBe(secret);
++    expect(calls[0].options.redirect).toBe('error');
++  });
++
++  it('keeps every protocol path that can expose or change a document behind admission', () => {
++    for (const type of ['openDocument', 'getLock', 'isSaveLock', 'saveChanges', 'unLockDocument', 'unSaveLock', 'forceSaveStart', 'rpc']) {
++      expect(guardedMessages.has(type)).toBe(true);
++    }
++    expect(isWriteMessage({type: 'openDocument'}, {view: true})).toBe(false);
++    expect(isWriteMessage({type: 'saveChanges'}, {view: true})).toBe(true);
++    expect(isWriteMessage({type: 'unSaveLock'}, {view: true})).toBe(true);
++    for (const type of ['sendForm', 'saveRelativeFromChanges', 'wopi_RenameFile', 'wopi_RefreshFile']) {
++      expect(isWriteMessage({type: 'rpc', data: {type}}, {view: true})).toBe(true);
++    }
++    expect(isWriteMessage({type: 'rpc', data: {type: 'pathurls'}}, {view: true})).toBe(false);
++  });
++});

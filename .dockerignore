@@ -1,0 +1,8 @@
+*
+!server/
+server/*
+!server/Common/
+!server/DocService/
+!server/FileConverter/
+!deckwise-slide.conf
+**/node_modules
