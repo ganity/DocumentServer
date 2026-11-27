@@ -368,3 +368,125 @@ index 0000000..7b2316b
 +    expect(isWriteMessage({type: 'rpc', data: {type: 'pathurls'}}, {view: true})).toBe(false);
 +  });
 +});
+diff --git a/DocService/sources/canvasservice.js b/DocService/sources/canvasservice.js
+index 3b2c0fef..19fe0dbd 100644
+--- a/DocService/sources/canvasservice.js
++++ b/DocService/sources/canvasservice.js
+@@ -55,6 +55,16 @@ const constants = require('./../../Common/sources/constants');
+ const commonDefines = require('./../../Common/sources/commondefines');
+ const storage = require('./../../Common/sources/storage/storage-base');
+ const formatChecker = require('./../../Common/sources/formatchecker');
++const {createDeckWiseArchive} = require('./deckwiseArchive');
++const archiveDeckWiseSave = createDeckWiseArchive(process.env.DECKWISE_DOCS_ACCESS_URL, process.env.DECKWISE_DOCS_ACCESS_SECRET);
++
++async function sendSaveCallback(ctx, uri, output, checkAuthorization, savePath) {
++  if (archiveDeckWiseSave && output.getExtName() === 'pptx') {
++    const archive = await archiveDeckWiseSave(uri, output.getStatus(), output.getKey(), () => storage.createReadStream(ctx, savePath));
++    if (archive) Object.assign(output, archive);
++  }
++  return docsCoServer.sendServerRequest(ctx, uri, output, checkAuthorization);
++}
+ const statsDClient = require('./../../Common/sources/statsdclient');
+ const operationContext = require('./../../Common/sources/operationContext');
+ const tenantManager = require('./../../Common/sources/tenantManager');
+@@ -1362,7 +1372,7 @@ const commandSfcCallback = co.wrap(function* (ctx, cmd, isSfcm, isEncrypted) {
+                   replyStr = JSON.stringify({error: 1, descr: 'wopi: no file'});
+                 }
+               } else {
+-                replyStr = yield docsCoServer.sendServerRequest(ctx, uri, outputSfc, checkAndFixAuthorizationLength);
++                replyStr = yield sendSaveCallback(ctx, uri, outputSfc, checkAndFixAuthorizationLength, savePathDoc);
+               }
+               const replyData = docsCoServer.parseReplyData(ctx, replyStr);
+               isSfcmSuccess = replyData && commonDefines.c_oAscServerCommandErrors.NoError == replyData.error;
+@@ -1401,7 +1411,7 @@ const commandSfcCallback = co.wrap(function* (ctx, cmd, isSfcm, isEncrypted) {
+                   replyStr = JSON.stringify({error: 1, descr: 'wopi: no file'});
+                 }
+               } else {
+-                replyStr = yield docsCoServer.sendServerRequest(ctx, uri, outputSfc, checkAndFixAuthorizationLength);
++                replyStr = yield sendSaveCallback(ctx, uri, outputSfc, checkAndFixAuthorizationLength, savePathDoc);
+               }
+             } catch (err) {
+               ctx.logger.error('sendServerRequest error: url = %s;data = %j %s', uri, outputSfc, err.stack);
+diff --git a/DocService/sources/deckwiseArchive.js b/DocService/sources/deckwiseArchive.js
+new file mode 100644
+index 00000000..de45cdc4
+--- /dev/null
++++ b/DocService/sources/deckwiseArchive.js
+@@ -0,0 +1,77 @@
++'use strict';
++
++const {createHash} = require('node:crypto');
++
++const maxBytes = 1024 ** 3;
++
++function createDeckWiseArchive(accessUrl, secret, request = fetch) {
++  if (!accessUrl || !secret) return null;
++  const access = new URL(accessUrl);
++  const grantUrl = new URL('archive-grant', access);
++  const callback = new URL('callback', access);
++  return async (uri, status, key, streamFactory) => {
++    if (uri !== callback.href || (status !== 2 && status !== 6)) return null;
++
++    const source = await streamFactory();
++    const size = source.contentLength;
++    if (!Number.isSafeInteger(size) || size < 1 || size > maxBytes) {
++      source.readStream.destroy();
++      throw new Error('DeckWise saved PPTX exceeds the archive size limit');
++    }
++    const sha256 = createHash('sha256');
++    const md5 = createHash('md5');
++    let bytes = 0;
++    for await (const chunk of source.readStream) {
++      bytes += chunk.length;
++      if (bytes > size) throw new Error('DeckWise saved PPTX changed during hashing');
++      sha256.update(chunk);
++      md5.update(chunk);
++    }
++    if (bytes !== size) throw new Error('DeckWise saved PPTX is incomplete');
++    const hash = sha256.digest('hex');
++    const checksum = md5.digest('base64');
++    const grant = async () => {
++      const response = await request(grantUrl, {
++        method: 'POST', redirect: 'error', signal: AbortSignal.timeout(35_000),
++        headers: {'Content-Type': 'application/json', 'X-DeckWise-Docs-Access': secret},
++        body: JSON.stringify({key, status, sha256: hash, md5: checksum, size})
++      });
++      if (!response.ok) {
++        await response.body?.cancel();
++        throw new Error('DeckWise save archive grant unavailable');
++      }
++      return response.json();
++    };
++    const target = await grant();
++    if (target.url !== null) {
++      const url = new URL(target.url);
++      if (url.protocol !== 'https:' || url.username || url.password || url.hash ||
++          !/^[a-z0-9-]+\.oss-[a-z0-9-]+\.aliyuncs\.com$/u.test(url.hostname)) {
++        throw new Error('Invalid DeckWise archive destination');
++      }
++      const headers = new Headers(target.headers);
++      if (headers.get('content-md5') !== checksum || headers.get('x-oss-meta-source-sha256') !== hash ||
++          headers.get('x-oss-forbid-overwrite') !== 'true') {
++        throw new Error('Invalid DeckWise archive checksum or overwrite grant');
++      }
++      headers.delete('host');
++      headers.set('content-length', String(size));
++      const body = await streamFactory();
++      try {
++        if (body.contentLength !== size) throw new Error('DeckWise saved PPTX changed before upload');
++        const uploaded = await request(url, {method: 'PUT', headers, body: body.readStream, duplex: 'half', redirect: 'error',
++          signal: AbortSignal.timeout(600_000)});
++        await uploaded.body?.cancel();
++        // A concurrent save with the same digest may already have completed this immutable object.
++        if (!uploaded.ok && (uploaded.status !== 409 || (await grant()).url !== null)) {
++          throw new Error('DeckWise saved PPTX archive upload failed');
++        }
++      } finally {
++        body.readStream.destroy();
++      }
++    }
++    return {deckwiseArchiveSha256: hash, deckwiseArchiveSize: size};
++  };
++}
++
++module.exports = {createDeckWiseArchive};

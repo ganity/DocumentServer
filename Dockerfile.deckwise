@@ -13,7 +13,6 @@ RUN --mount=type=cache,target=/root/.npm npm ci --omit=dev --prefix Common \
 FROM onlyoffice/documentserver:10.0.0@sha256:ca17889f10b11141cc6441836aebdd2835cf3e1b49681b2fd6e155c94b7850b3
 WORKDIR /var/www/onlyoffice/documentserver/server
 COPY --from=dependencies /usr/local/bin/node /usr/local/bin/node
-COPY deckwise-transfer.mjs /opt/deckwise/transfer.mjs
 COPY --chown=ds:ds server/Common/sources Common/sources
 COPY --chown=ds:ds server/DocService/sources DocService/sources
 COPY --chown=ds:ds server/FileConverter/sources FileConverter/sources

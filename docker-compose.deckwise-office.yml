@@ -14,18 +14,6 @@ services:
     networks:
       - trainwise_net
 
-  deckwise-transfer:
-    image: "${DECKWISE_DOCS_IMAGE:?Set the image built with the DeckWise Document Server changes}"
-    entrypoint: ["/usr/local/bin/node", "/opt/deckwise/transfer.mjs"]
-    user: "999:999"
-    environment:
-      DECKWISE_DOCS_ACCESS_SECRET: "${DECKWISE_DOCS_ACCESS_SECRET:?Set the shared Platform access-check secret}"
-      DECKWISE_TRANSFER_OSS_ORIGIN: "${DECKWISE_TRANSFER_OSS_ORIGIN:?Set the exact origin used in signed OSS URLs}"
-      DECKWISE_TRANSFER_DOCS_ORIGIN: https://trainwise.efrobot.com
-    restart: unless-stopped
-    networks:
-      - trainwise_net
-
 volumes:
   deckwise-docs-files:
   deckwise-docs-db:
