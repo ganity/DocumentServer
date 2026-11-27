@@ -5,4 +5,5 @@ server/*
 !server/DocService/
 !server/FileConverter/
 !deckwise-slide.conf
+!deckwise-transfer.mjs
 **/node_modules

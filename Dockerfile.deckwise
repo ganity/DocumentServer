@@ -13,6 +13,7 @@ RUN --mount=type=cache,target=/root/.npm npm ci --omit=dev --prefix Common \
 FROM onlyoffice/documentserver:10.0.0@sha256:ca17889f10b11141cc6441836aebdd2835cf3e1b49681b2fd6e155c94b7850b3
 WORKDIR /var/www/onlyoffice/documentserver/server
 COPY --from=dependencies /usr/local/bin/node /usr/local/bin/node
+COPY deckwise-transfer.mjs /opt/deckwise/transfer.mjs
 COPY --chown=ds:ds server/Common/sources Common/sources
 COPY --chown=ds:ds server/DocService/sources DocService/sources
 COPY --chown=ds:ds server/FileConverter/sources FileConverter/sources
@@ -26,6 +27,7 @@ RUN set -eu; \
     sed -i -E "s/^const buildVersion = '[^']+';/const buildVersion = '$version';/; s/^const buildNumber = [0-9]+;/const buildNumber = $build;/" Common/sources/commondefines.js; \
     grep -Fx "const buildVersion = '$version';" Common/sources/commondefines.js; \
     grep -Fx "const buildNumber = $build;" Common/sources/commondefines.js; \
+    /usr/local/bin/node -e 'const fs = require("node:fs"); const path = "/etc/onlyoffice/documentserver/default.json"; const config = JSON.parse(fs.readFileSync(path)); config.FileConverter.converter.maxDownloadBytes = 1073741824; config.FileConverter.converter.downloadTimeout.wholeCycle = "10m"; fs.writeFileSync(path, JSON.stringify(config, null, 2));'; \
     sed -i 's#^command=.*#command=/usr/local/bin/node /var/www/onlyoffice/documentserver/server/DocService/sources/server.js#' /etc/supervisor/conf.d/ds-docservice.conf; \
     sed -i 's#service supervisor start#/etc/init.d/supervisor start#' /app/ds/run-document-server.sh; \
     grep -F '/etc/init.d/supervisor start' /app/ds/run-document-server.sh
